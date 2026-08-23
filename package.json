@@ -1,6 +1,6 @@
 {
   "name": "@npv12/opencode-mini-session",
-  "version": "0.0.1",
+  "version": "0.1.1",
   "type": "module",
   "engines": {
     "opencode": "0.0.0-beta-17963"
