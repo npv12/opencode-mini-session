@@ -1,6 +1,6 @@
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import type { Agent, PermissionRuleset } from "@opencode-ai/sdk/v2";
-import { DEFAULT_ALLOWED_TOOLS } from "./constants";
+import type { Plugin } from "@opencode-ai/plugin/tui";
+import type { AgentInfo, SessionMessageInfo } from "@opencode-ai/client";
+import { DEFAULT_FULL_TOKEN_LIMIT } from "./constants";
 import { formatResolvedModel } from "./model";
 import type { MiniConfig, MiniMode, ResolvedModel } from "./types";
 
@@ -10,249 +10,101 @@ const MINI_SIDE_QUESTION_INSTRUCTION =
 const MINI_FRESH_INSTRUCTION =
   "You are answering a quick side question about an ongoing coding session. No conversation context from the main session has been copied into this mini session. Answer concisely based only on the current mini-session messages and any tools or files you inspect.";
 
-const ADDITIONAL_PERMISSION_IDS = [
-  "edit",
-  "bash",
-  "task",
-  "external_directory",
-  "todowrite",
-  "question",
-  "websearch",
-  "codesearch",
-  "repo_clone",
-  "repo_overview",
-  "lsp",
-  "doom_loop",
-  "skill",
-];
-
-export type MiniAgentMode = "plugin-managed" | "custom-agent";
-export type MiniPermissionSource = "plugin-managed" | "agent";
+const MINI_TOOL_NOTE = " You may only use the following tools: glob, grep, list, read, webfetch. Do not attempt to use any other tools.";
 
 export type MiniAgentModeResolution =
-  | {
-      mode: "plugin-managed";
-      requestedAgent: string | null;
-      missingAgent?: string;
-      unavailableAgent?: string;
-    }
-  | {
-      mode: "custom-agent";
-      requestedAgent: string;
-      agent: string;
-    };
+  | { mode: "plugin-managed"; requestedAgent: string | null; missingAgent?: string; unavailableAgent?: string }
+  | { mode: "custom-agent"; requestedAgent: string; agent: string };
 
-export type PluginManagedMiniAgent = {
-  mode: "plugin-managed";
-  requestedAgent: string | null;
-  missingAgent?: string;
-  unavailableAgent?: string;
-  agent: null;
-  permission: PermissionRuleset;
-  permissionSource: "plugin-managed";
-  notices: string[];
-};
+export type ResolvedMiniAgent =
+  | { mode: "plugin-managed"; requestedAgent: string | null; missingAgent?: string; unavailableAgent?: string; notices: string[] }
+  | { mode: "custom-agent"; requestedAgent: string; agent: string; notices: string[] };
 
-export type CustomMiniAgent = {
-  mode: "custom-agent";
-  requestedAgent: string;
-  agent: string;
-  permission?: undefined;
-  permissionSource: "agent";
-  notices: string[];
-};
-
-export type ResolvedMiniAgent = PluginManagedMiniAgent | CustomMiniAgent;
-
-export type MiniSessionCreatePayload = {
-  parentID: string;
-  title: string;
-  directory: string;
-  agent?: string;
-  permission?: PermissionRuleset;
-};
-
-export type MiniPromptPayload = {
-  sessionID: string;
-  system: string;
-  agent?: string;
-  model?: NonNullable<ResolvedModel["model"]>;
-  variant?: string;
-  parts: Array<{ type: "text"; text: string }>;
-};
-
-export async function resolveRuntimeMiniAgent(
-  api: TuiPluginApi,
+export function resolveRuntimeMiniAgent(
+  context: Plugin.Context,
   config: MiniConfig,
-): Promise<ResolvedMiniAgent> {
-  const agents = await getAvailableAgents(api);
-  const mode = resolveMiniAgentMode(config, agents);
-  const toolIDs =
-    mode.mode === "plugin-managed" ? await getAvailableToolIDs(api) : [];
-
-  return buildResolvedMiniAgent(config, mode, toolIDs);
+): ResolvedMiniAgent {
+  const agents = context.data.location.agent.list();
+  const mode = resolveMiniAgentMode(config, agents ? [...agents] : null);
+  return buildResolvedMiniAgent(config, mode);
 }
 
 export function resolveMiniAgent(
   config: MiniConfig,
-  agents: Pick<Agent, "name">[] | null,
-  availableToolIDs: string[] = DEFAULT_ALLOWED_TOOLS,
+  agents: Pick<AgentInfo, "name">[] | null,
 ): ResolvedMiniAgent {
-  return buildResolvedMiniAgent(
-    config,
-    resolveMiniAgentMode(config, agents),
-    availableToolIDs,
-  );
+  return buildResolvedMiniAgent(config, resolveMiniAgentMode(config, agents));
 }
 
 export function resolveMiniAgentMode(
   config: MiniConfig,
-  agents: Pick<Agent, "name">[] | null,
+  agents: Pick<AgentInfo, "name">[] | null,
 ): MiniAgentModeResolution {
-  if (!config.agent) {
-    return { mode: "plugin-managed", requestedAgent: null };
-  }
-
-  if (agents === null) {
-    return {
-      mode: "plugin-managed",
-      requestedAgent: config.agent,
-      unavailableAgent: config.agent,
-    };
-  }
-
-  const match = agents.find((agent) => agent.name === config.agent);
-  if (match) {
-    return {
-      mode: "custom-agent",
-      requestedAgent: config.agent,
-      agent: match.name,
-    };
-  }
-
-  return {
-    mode: "plugin-managed",
-    requestedAgent: config.agent,
-    missingAgent: config.agent,
-  };
+  if (!config.agent) return { mode: "plugin-managed", requestedAgent: null };
+  if (agents === null) return { mode: "plugin-managed", requestedAgent: config.agent, unavailableAgent: config.agent };
+  const match = agents.find((a) => a.name === config.agent);
+  if (match) return { mode: "custom-agent", requestedAgent: config.agent, agent: match.name };
+  return { mode: "plugin-managed", requestedAgent: config.agent, missingAgent: config.agent };
 }
 
-export function buildResolvedMiniAgent(
-  config: MiniConfig,
-  mode: MiniAgentModeResolution,
-  availableToolIDs: string[],
-): ResolvedMiniAgent {
+export function buildResolvedMiniAgent(config: MiniConfig, mode: MiniAgentModeResolution): ResolvedMiniAgent {
   if (mode.mode === "custom-agent") {
-    return {
-      mode: "custom-agent",
-      requestedAgent: mode.requestedAgent,
-      agent: mode.agent,
-      permissionSource: "agent",
-      notices: buildMiniAgentNotices(config, mode),
-    };
+    return { mode: "custom-agent", requestedAgent: mode.requestedAgent, agent: mode.agent, notices: buildMiniAgentNotices(config, mode) };
   }
-
   return {
     mode: "plugin-managed",
     requestedAgent: mode.requestedAgent,
     missingAgent: mode.missingAgent,
     unavailableAgent: mode.unavailableAgent,
-    agent: null,
-    permission: buildPermissionRules(availableToolIDs),
-    permissionSource: "plugin-managed",
     notices: buildMiniAgentNotices(config, mode),
   };
 }
 
-export function buildMiniSystemPrompt(
-  context: string,
+export function buildMiniPreamble(
+  contextText: string,
   resolved: ResolvedMiniAgent,
   mode: MiniMode = "main",
-) {
-  const intro = buildMiniSystemIntro(resolved, mode);
-  const toolNote =
-    resolved.mode === "plugin-managed"
-      ? buildToolSystemNote(DEFAULT_ALLOWED_TOOLS)
-      : "";
-
-  const sessionContext = context.trim()
-    ? `\n\n<session-context>\n${context}\n</session-context>`
+): string {
+  const intro = buildMiniIntro(resolved, mode);
+  const toolNote = resolved.mode === "plugin-managed" ? MINI_TOOL_NOTE : "";
+  const sessionContext = contextText.trim()
+    ? `\n\n<session-context>\n${contextText}\n</session-context>`
     : "";
-
   return `${intro}${toolNote}${sessionContext}`;
 }
 
-function buildMiniSystemIntro(resolved: ResolvedMiniAgent, mode: MiniMode) {
+function buildMiniIntro(resolved: ResolvedMiniAgent, mode: MiniMode): string {
   if (resolved.mode !== "custom-agent") {
-    return mode === "fresh"
-      ? MINI_FRESH_INSTRUCTION
-      : MINI_SIDE_QUESTION_INSTRUCTION;
+    return mode === "fresh" ? MINI_FRESH_INSTRUCTION : MINI_SIDE_QUESTION_INSTRUCTION;
   }
-
   if (mode === "fresh") {
     return `You are answering a quick side question about an ongoing coding session and you are running as the configured OpenCode agent "${resolved.agent}". Follow that agent's own instructions, role, tone, and constraints closely while answering this as a mini side question. No conversation context from the main session has been copied into this mini session.`;
   }
-
   return `You are answering a quick side question about an ongoing coding session and you are running as the configured OpenCode agent "${resolved.agent}". Follow that agent's own instructions, role, tone, and constraints closely while answering this as a mini side question. Below is the conversation context from the session.`;
 }
 
-export function buildMiniSessionCreatePayload(
+export function buildSessionCreatePayload(
   resolved: ResolvedMiniAgent,
-  base: MiniSessionCreatePayload,
-): MiniSessionCreatePayload {
+  base: { title: string; directory: string; agent?: string; model?: NonNullable<ResolvedModel> & { variant?: string } },
+): {
+  title: string;
+  agent?: string;
+  model?: NonNullable<ResolvedModel> & { variant?: string };
+  location?: { directory: string };
+} {
   return {
-    ...base,
+    title: base.title,
+    location: { directory: base.directory },
     ...(resolved.mode === "custom-agent" ? { agent: resolved.agent } : {}),
-    ...(resolved.mode === "plugin-managed"
-      ? { permission: resolved.permission }
+    ...(base.model?.providerID && base.model?.id
+      ? { model: { providerID: base.model.providerID, id: base.model.id, ...(base.model.variant ? { variant: base.model.variant } : {}) } }
       : {}),
   };
 }
 
-export function buildMiniPromptPayload(
-  resolved: ResolvedMiniAgent,
-  options: {
-    sessionID: string;
-    system: string;
-    prompt: string;
-    resolvedModel: ResolvedModel;
-  },
-): MiniPromptPayload {
-  return {
-    sessionID: options.sessionID,
-    system: options.system,
-    parts: [{ type: "text", text: options.prompt }],
-    ...(resolved.mode === "custom-agent" ? { agent: resolved.agent } : {}),
-    ...(options.resolvedModel.model ? { model: options.resolvedModel.model } : {}),
-    ...(options.resolvedModel.variant
-      ? { variant: options.resolvedModel.variant }
-      : {}),
-  };
-}
-
-export function formatMiniNotice(...notices: Array<string | undefined>) {
-  const filtered = notices.filter(
-    (notice): notice is string => typeof notice === "string" && Boolean(notice),
-  );
+export function formatMiniNotice(...notices: Array<string | undefined>): string | undefined {
+  const filtered = notices.filter((n): n is string => typeof n === "string" && n.length > 0);
   return filtered.length > 0 ? filtered.join(" ") : undefined;
-}
-
-export function formatMiniAgentDiagnostics(resolved: ResolvedMiniAgent) {
-  const fields = [
-    `mode=${resolved.mode}`,
-    `agent=${resolved.agent ?? "(default)"}`,
-    `permission=${resolved.permissionSource}`,
-  ];
-
-  if (resolved.mode === "plugin-managed" && resolved.requestedAgent) {
-    fields.push(`requestedAgent=${resolved.requestedAgent}`);
-  }
-
-  if (resolved.mode === "plugin-managed") {
-    fields.push(`tools=${DEFAULT_ALLOWED_TOOLS.length}`);
-  }
-
-  return fields;
 }
 
 export function buildMiniErrorDetail(options: {
@@ -260,78 +112,23 @@ export function buildMiniErrorDetail(options: {
   sessionID?: string;
   resolvedModel: ResolvedModel;
   resolvedAgent: ResolvedMiniAgent;
-}) {
+}): string {
   return [
     `Diagnostics: path=${options.path}`,
     `session=${options.sessionID ?? "pending"}`,
-    ...formatMiniAgentDiagnostics(options.resolvedAgent),
+    `mode=${options.resolvedAgent.mode}`,
+    `agent=${options.resolvedAgent.mode === "custom-agent" ? options.resolvedAgent.agent : "(plugin-managed)"}`,
     `model=${formatResolvedModel(options.resolvedModel)}`,
   ].join(", ");
 }
 
-async function getAvailableAgents(api: TuiPluginApi): Promise<Agent[] | null> {
-  try {
-    const result = await api.client.app.agents(
-      { directory: api.state.path.directory },
-      { throwOnError: true },
-    );
-    if (Array.isArray(result.data)) return result.data;
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
-async function getAvailableToolIDs(api: TuiPluginApi): Promise<string[]> {
-  try {
-    const result = await api.client.tool.ids(
-      { directory: api.state.path.directory },
-      { throwOnError: true },
-    );
-    if (
-      Array.isArray(result.data) &&
-      result.data.every((item) => typeof item === "string")
-    ) {
-      return result.data;
-    }
-  } catch {}
-
-  return DEFAULT_ALLOWED_TOOLS;
-}
-
-function buildMiniAgentNotices(
-  config: MiniConfig,
-  mode: MiniAgentModeResolution,
-) {
+function buildMiniAgentNotices(config: MiniConfig, mode: MiniAgentModeResolution): string[] {
   const notices: string[] = [];
-
   if (mode.mode === "plugin-managed" && mode.missingAgent) {
-    notices.push(
-      `Configured mini agent ${mode.missingAgent} was not found. Falling back to plugin-managed mini mode.`,
-    );
+    notices.push(`Configured mini agent ${mode.missingAgent} was not found. Falling back to plugin-managed mini mode.`);
   }
-
   if (mode.mode === "plugin-managed" && mode.unavailableAgent) {
-    notices.push(
-      `Could not verify configured mini agent ${mode.unavailableAgent} because the agent list is unavailable. Falling back to plugin-managed mini mode.`,
-    );
+    notices.push(`Could not verify configured mini agent ${mode.unavailableAgent} because the agent list is unavailable. Falling back to plugin-managed mini mode.`);
   }
-
   return notices;
-}
-
-function buildToolSystemNote(tools: string[]) {
-  return ` You may only use the following tools: ${tools.join(", ")}. Do not attempt to use any other tools.`;
-}
-
-function buildPermissionRules(toolIDs: string[]): PermissionRuleset {
-  const permissionIDs = [
-    ...new Set([...toolIDs, ...ADDITIONAL_PERMISSION_IDS, ...DEFAULT_ALLOWED_TOOLS]),
-  ];
-  return permissionIDs.map((permission) => ({
-    permission,
-    pattern: "*",
-    action: DEFAULT_ALLOWED_TOOLS.includes(permission) ? "allow" : "deny",
-  }));
 }

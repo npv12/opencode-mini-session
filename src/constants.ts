@@ -21,17 +21,7 @@ export const SCROLL_LINE_DELTA = 4;
 export const SCROLL_PAGE_DELTA = 14;
 
 export const DEFAULT_FULL_TOKEN_LIMIT = 50_000;
-export const DEFAULT_KEYBIND = "alt+b";
-export const DEFAULT_FRESH_KEYBIND = "alt+n";
-export const DEFAULT_TOGGLE_THINKING_KEYBIND = "ctrl+t";
+export const DEFAULT_KEYBIND = "ctrl+n";
+export const DEFAULT_FRESH_KEYBIND = "ctrl+f";
+export const DEFAULT_TOGGLE_THINKING_KEYBIND = "ctrl+o";
 export const THINKING_TEXT = "Thinking...";
-
-export const SAFE_TOOLS = {
-  glob: true,
-  grep: true,
-  list: true,
-  read: true,
-  webfetch: true,
-};
-
-export const DEFAULT_ALLOWED_TOOLS = Object.keys(SAFE_TOOLS);

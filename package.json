@@ -1,9 +1,9 @@
 {
-  "name": "opencode-mini-session",
-  "version": "1.1.3",
+  "name": "@npv12/opencode-mini-session",
+  "version": "0.0.1",
   "type": "module",
   "engines": {
-    "opencode": ">=1.17.18 <2"
+    "opencode": "0.0.0-beta-17963"
   },
   "exports": {
     "./tui": "./dist/index.js"
@@ -13,7 +13,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/karamanliev/opencode-mini-session"
+    "url": "https://github.com/npv12/opencode-mini-session"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -24,16 +24,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opentui/core": "^0.4.3",
-    "@opentui/solid": "^0.4.3",
-    "solid-js": "^1.9.12"
+    "@opencode-ai/client": "0.0.0-beta-17963",
+    "@opencode-ai/plugin": "0.0.0-beta-17963",
+    "@opencode-ai/theme": "0.0.0-beta-17963",
+    "@opentui/core": "0.5.7",
+    "@opentui/solid": "0.5.7",
+    "solid-js": "1.9.14"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",
     "@babel/preset-typescript": "^7.27.1",
-    "@opencode-ai/plugin": "^1.17.18",
-    "@opencode-ai/sdk": "^1.17.18",
-    "@opentui/keymap": "^0.4.3",
     "@types/node": "^25.9.1",
     "babel-preset-solid": "^1.9.12",
     "typescript": "^5.9.3",

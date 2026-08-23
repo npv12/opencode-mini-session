@@ -1,6 +1,6 @@
 import type { InputRenderable, ScrollBoxRenderable } from "@opentui/core";
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import type { Message, Part } from "@opencode-ai/sdk/v2";
+import type { Plugin } from "@opencode-ai/plugin/tui";
+import type { ModelRef, SessionMessageInfo } from "@opencode-ai/client";
 import type { FooterCounterState } from "./counter";
 
 export type MiniConfig = {
@@ -16,16 +16,9 @@ export type MiniConfig = {
 
 export type MiniMode = "main" | "fresh";
 
-export type SessionEntry = {
-  info: Message;
-  parts: Part[];
-};
-
 export type ResolvedModel = {
-  model?: {
-    providerID: string;
-    modelID: string;
-  };
+  providerID?: string;
+  id?: string;
   variant?: string;
 };
 
@@ -55,7 +48,7 @@ export type ActiveDialogController = {
 
 export type AnswerDialogState = {
   mode: MiniMode;
-  entries: SessionEntry[];
+  entries: SessionMessageInfo[];
   streamingAnswer: string;
   loading: boolean;
   scrollbarVisible: boolean;
@@ -69,16 +62,13 @@ export type AnswerDialogState = {
   thinkingEnabled: boolean;
   expandedThinkingPartIDs: Record<string, true>;
   notice?: string;
-  update?: string;
   error?: string;
   errorDetail?: string;
-  messageModels: Record<string, string>;
 };
 
 export type AnswerDialogProps = {
-  api: TuiPluginApi;
+  context: Plugin.Context;
   title: string;
-  version?: string;
   modelName: string;
   hideKey: string | false;
   toggleThinkingKeybind: string | false;

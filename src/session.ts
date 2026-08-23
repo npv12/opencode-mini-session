@@ -1,26 +1,24 @@
 import type { InputRenderable, ScrollBoxRenderable } from "@opentui/core";
-import type {
-  TuiDialogSelectOption,
-  TuiPluginApi,
-} from "@opencode-ai/plugin/tui";
+import type { Plugin } from "@opencode-ai/plugin/tui";
+import type { ModelInfo, ProviderInfo, SessionCreateInput, SessionMessageInfo } from "@opencode-ai/client";
 import type { Setter } from "solid-js";
 import { version } from "../package.json";
 import { buildFooterCounterState } from "./counter";
 import {
+  buildMiniPreamble,
+  buildSessionCreatePayload,
   buildMiniErrorDetail,
-  buildMiniPromptPayload,
-  buildMiniSessionCreatePayload,
-  buildMiniSystemPrompt,
   formatMiniNotice,
   resolveRuntimeMiniAgent,
   type ResolvedMiniAgent,
 } from "./agent";
-import { buildCopiedContext, getSessionEntries } from "./context";
+import { getSessionEntries, buildCopiedContext } from "./context";
 import { getErrorMessage } from "./diagnostics";
 import {
   resolveDefaultModel,
   formatResolvedModel,
   resolveModelContextWindow,
+  type ResolvedModelWithSource,
   type ModelSource,
 } from "./model";
 import type {
@@ -38,18 +36,16 @@ type ModelSelectValue =
   | { type: "default" }
   | {
       type: "model";
-      model: NonNullable<ResolvedModel["model"]>;
-      variant?: string;
+      model: ResolvedModel;
     };
 
 type ErrorPath =
   | "promptAsync throw"
-  | "session.error event"
+  | "session.execution.failed"
   | "session.create throw";
 
-
 export function openMiniSession(
-  api: TuiPluginApi,
+  context: Plugin.Context,
   config: MiniConfig,
   mode: MiniMode,
   setOverlay: Setter<OverlayState | undefined>,
@@ -57,73 +53,52 @@ export function openMiniSession(
   modelPreference: ModelPreferenceState,
   thinkingPreference: ThinkingPreferenceState,
   openPickerFn: (onAfterSelect: () => void) => void,
-  getUpdateWarning?: () => string | undefined,
 ): boolean {
-  const currentRoute = api.route.current;
-
-  if (currentRoute.name !== "session") {
-    api.ui.toast({
-      variant: "error",
-      message: "mini only works inside a session.",
-    });
+  const currentRoute = context.ui.router.current();
+  if (currentRoute.type !== "session") {
+    context.ui.toast.show({ variant: "error", message: "mini only works inside a session." });
     return false;
   }
-
-  const activeDialog = active.get();
-  if (activeDialog) {
-    activeDialog.show();
+  if (active.get()) {
+    active.get()!.show();
     return false;
   }
-
-  const { sessionID } = currentRoute.params as { sessionID: string };
-  void startQuestion(
-    api,
-    config,
-    mode,
-    sessionID,
-    setOverlay,
-    active,
-    modelPreference,
-    thinkingPreference,
-    openPickerFn,
-    getUpdateWarning,
-  );
+  void startQuestion(context, config, mode, currentRoute.sessionID, setOverlay, active, modelPreference, thinkingPreference, openPickerFn);
   return true;
 }
 
 export async function startQuestion(
-  api: TuiPluginApi,
+  context: Plugin.Context,
   config: MiniConfig,
   mode: MiniMode,
-  sessionID: string,
+  originSessionID: string,
   setOverlay: Setter<OverlayState | undefined>,
   active: ActiveDialog,
   modelPreference: ModelPreferenceState,
   thinkingPreference: ThinkingPreferenceState,
   openPickerFn: (onAfterSelect: () => void) => void,
-  getUpdateWarning?: () => string | undefined,
 ) {
-  const entries = getSessionEntries(api, sessionID);
+  const entries = getSessionEntries(context, originSessionID);
   const copiedContext =
     mode === "main"
       ? buildCopiedContext(entries, config.tokenLimit)
       : { text: "", usedTokens: undefined, totalAvailableTokens: undefined };
-  const context = copiedContext.text;
+  const contextText = copiedContext.text;
+  const sessionInfo = context.data.session.get(originSessionID);
+  const models = context.data.location.model.list(sessionInfo?.location) as ModelInfo[] | undefined;
+  const providers = context.data.location.provider.list(sessionInfo?.location);
   const defaultResolvedModel = resolveDefaultModel(
-    api.state.provider,
-    config.model,
-    config.variant,
-    entries,
+    models, config.model, config.variant, sessionInfo?.model, entries,
   );
-  const getResolvedModel = () =>
-    modelPreference.get() ?? defaultResolvedModel.model;
+  const getResolvedModel = () => modelPreference.get() ?? defaultResolvedModel.model;
   const getModelName = () => formatResolvedModel(getResolvedModel());
   const hideKey = mode === "fresh" ? config.freshKeybind : config.keybind;
   const hiddenCommand = mode === "fresh" ? "/mini-fresh" : "/mini";
   const title = mode === "fresh" ? "mini fresh" : "mini session";
-  const previousFocus = api.renderer.currentFocusedRenderable;
+  const previousFocus = context.renderer.currentFocusedRenderable;
   let resolvedAgent: ResolvedMiniAgent;
   let system = "";
+  let preamble = "";
 
   const dialogState: AnswerDialogState = {
     mode,
@@ -140,13 +115,9 @@ export async function startQuestion(
     inputPlaceholder: undefined,
     thinkingEnabled: thinkingPreference.get(),
     expandedThinkingPartIDs: {},
-    update: getUpdateWarning?.(),
     notice: undefined,
     errorDetail: undefined,
-    messageModels: {},
   };
-
-  const submissionModelQueue: string[] = [];
 
   const unsubscribers: Array<() => void> = [];
   let tempSessionID: string | undefined;
@@ -168,10 +139,7 @@ export async function startQuestion(
   const incrementedTokenMessageIDs = new Set<string>();
 
   const syncCounterState = () => {
-    dialogState.modelContextWindow = resolveModelContextWindow(
-      api.state.provider,
-      getResolvedModel(),
-    );
+    dialogState.modelContextWindow = resolveModelContextWindow(models, getResolvedModel());
     dialogState.footerCounter = buildFooterCounterState({
       mode: dialogState.mode,
       copiedContextTokens: dialogState.copiedContextTokens,
@@ -183,133 +151,49 @@ export async function startQuestion(
     dialogState.inputPlaceholder = dialogState.footerCounter.placeholder;
   };
 
-  const clearScrollTimer = () => {
-    pendingScrollToBottom = false;
-    if (!scrollTimer) return;
-    clearTimeout(scrollTimer);
-    scrollTimer = undefined;
-  };
-
-  const clearFocusTimer = () => {
-    if (!focusTimer) return;
-    clearTimeout(focusTimer);
-    focusTimer = undefined;
-  };
-
-  const clearSpinnerTimer = () => {
-    if (!spinnerTimer) return;
-    clearInterval(spinnerTimer);
-    spinnerTimer = undefined;
-  };
-
+  const clearScrollTimer = () => { pendingScrollToBottom = false; if (!scrollTimer) return; clearTimeout(scrollTimer); scrollTimer = undefined; };
+  const clearFocusTimer = () => { if (!focusTimer) return; clearTimeout(focusTimer); focusTimer = undefined; };
+  const clearSpinnerTimer = () => { if (!spinnerTimer) return; clearInterval(spinnerTimer); spinnerTimer = undefined; };
   const startSpinnerTimer = () => {
     if (spinnerTimer || closed || hidden || !dialogState.loading) return;
     spinnerTimer = setInterval(() => {
-      if (closed || hidden || !dialogState.loading) {
-        clearSpinnerTimer();
-        return;
-      }
+      if (closed || hidden || !dialogState.loading) { clearSpinnerTimer(); return; }
       dialogState.spinnerFrame = (dialogState.spinnerFrame + 1) % 10;
       renderOverlay();
     }, 80);
   };
-
   const scheduleInputFocus = () => {
     if (closed || hidden) return;
     clearFocusTimer();
-    focusTimer = setTimeout(() => {
-      focusTimer = undefined;
-      if (closed || hidden) return;
-      overlayInput?.focus();
-      api.renderer.requestRender();
-    }, 0);
+    focusTimer = setTimeout(() => { focusTimer = undefined; if (closed || hidden) return; overlayInput?.focus(); context.renderer.requestRender(); }, 0);
   };
-
   const isScrollerAtBottom = () => {
     if (!overlayScroller) return true;
-    const maxScrollTop = Math.max(
-      0,
-      overlayScroller.scrollHeight - overlayScroller.viewport.height,
-    );
-    return overlayScroller.scrollTop >= maxScrollTop - 1;
+    return overlayScroller.scrollTop >= Math.max(0, overlayScroller.scrollHeight - overlayScroller.viewport.height) - 1;
   };
-
-  const updateScrollSnapshot = () => {
-    lastScrollTop = overlayScroller?.scrollTop ?? 0;
-    lastScrollHeight = overlayScroller?.scrollHeight ?? 0;
-  };
-
+  const updateScrollSnapshot = () => { lastScrollTop = overlayScroller?.scrollTop ?? 0; lastScrollHeight = overlayScroller?.scrollHeight ?? 0; };
   const scheduleScrollToBottom = () => {
     if (closed || hidden) return;
     clearScrollTimer();
     pendingScrollToBottom = true;
-    scrollTimer = setTimeout(() => {
-      scrollTimer = undefined;
-      if (closed || hidden) {
-        pendingScrollToBottom = false;
-        return;
-      }
-      overlayScroller?.scrollTo(Number.MAX_SAFE_INTEGER);
-      updateScrollSnapshot();
-      pendingScrollToBottom = false;
-      api.renderer.requestRender();
-    }, 0);
+    scrollTimer = setTimeout(() => { scrollTimer = undefined; if (closed || hidden) { pendingScrollToBottom = false; return; } overlayScroller?.scrollTo(Number.MAX_SAFE_INTEGER); updateScrollSnapshot(); pendingScrollToBottom = false; context.renderer.requestRender(); }, 0);
   };
-
-  const scrollBy = (delta: number) => {
-    followStreamingToBottom = false;
-    forceScrollToBottom = false;
-    pendingScrollToBottom = false;
-    clearScrollTimer();
-    overlayScroller?.scrollBy(delta);
-    updateScrollSnapshot();
-  };
-
-  const scrollTo = (position: number) => {
-    followStreamingToBottom = position === Number.MAX_SAFE_INTEGER;
-    forceScrollToBottom = position === Number.MAX_SAFE_INTEGER;
-    pendingScrollToBottom = false;
-    if (position !== Number.MAX_SAFE_INTEGER) clearScrollTimer();
-    overlayScroller?.scrollTo(position);
-    updateScrollSnapshot();
-  };
-
-  const restorePreviousFocus = () => {
-    setTimeout(() => {
-      if (previousFocus && !previousFocus.isDestroyed) {
-        previousFocus.focus();
-      }
-      api.renderer.requestRender();
-    }, 0);
-  };
+  const scrollBy = (delta: number) => { followStreamingToBottom = false; forceScrollToBottom = false; pendingScrollToBottom = false; clearScrollTimer(); overlayScroller?.scrollBy(delta); updateScrollSnapshot(); };
+  const scrollTo = (position: number) => { followStreamingToBottom = position === Number.MAX_SAFE_INTEGER; forceScrollToBottom = position === Number.MAX_SAFE_INTEGER; pendingScrollToBottom = false; if (position !== Number.MAX_SAFE_INTEGER) clearScrollTimer(); overlayScroller?.scrollTo(position); updateScrollSnapshot(); };
+  const restorePreviousFocus = () => { setTimeout(() => { if (previousFocus && !previousFocus.isDestroyed) previousFocus.focus(); context.renderer.requestRender(); }, 0); };
 
   const hide = () => {
     if (closed || hidden) return;
     hidden = true;
-    if (renderTimer) {
-      clearTimeout(renderTimer);
-      renderTimer = undefined;
-    }
-    clearScrollTimer();
-    clearFocusTimer();
-    clearSpinnerTimer();
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = undefined; }
+    clearScrollTimer(); clearFocusTimer(); clearSpinnerTimer();
     setOverlay(undefined);
     restorePreviousFocus();
-    api.ui.toast({
-      variant: "info",
-      message: hideKey
-        ? `mini hidden. Press ${hideKey} to show it.`
-        : `mini hidden. Run ${hiddenCommand} to show it.`,
-      duration: 1000,
-    });
+    context.ui.toast.show({ variant: "info", message: hideKey ? `mini hidden. Press ${hideKey} to show it.` : `mini hidden. Run ${hiddenCommand} to show it.`, duration: 1000 });
   };
 
   const closeFromUser = async () => {
-    api.ui.toast({
-      variant: "info",
-      message: "mini session closed.",
-      duration: 1000,
-    });
+    context.ui.toast.show({ variant: "info", message: "mini session closed.", duration: 1000 });
     await cleanup();
   };
 
@@ -317,121 +201,68 @@ export async function startQuestion(
     if (closed) return;
     closed = true;
     if (active.get() === controller) active.set(undefined);
-    while (unsubscribers.length > 0) {
-      try {
-        unsubscribers.pop()?.();
-      } catch {}
-    }
+    while (unsubscribers.length > 0) { try { unsubscribers.pop()?.(); } catch {} }
     if (renderTimer) clearTimeout(renderTimer);
-    clearScrollTimer();
-    clearFocusTimer();
-    clearSpinnerTimer();
+    clearScrollTimer(); clearFocusTimer(); clearSpinnerTimer();
     setOverlay(undefined);
     restorePreviousFocus();
     if (!tempSessionID) return;
     const ephemeralSessionID = tempSessionID;
     tempSessionID = undefined;
-    try {
-      await api.client.session.abort(
-        { sessionID: ephemeralSessionID },
-        { throwOnError: true },
-      );
-    } catch {}
-    try {
-      await api.client.session.delete(
-        { sessionID: ephemeralSessionID },
-        { throwOnError: true },
-      );
-    } catch {}
+    try { await context.client.session.interrupt({ sessionID: ephemeralSessionID }); } catch {}
+    try { await context.client.session.remove({ sessionID: ephemeralSessionID }); } catch {}
   };
 
   const continueInMainThread = async () => {
     const transcript = buildMiniSessionTranscript(dialogState);
-    if (continuing || dialogState.loading || dialogState.error || !transcript)
-      return;
+    if (continuing || dialogState.loading || dialogState.error || !transcript) return;
     continuing = true;
-
     try {
-      await api.client.tui.appendPrompt(
-        { text: buildContinuePrompt(transcript) },
-        { throwOnError: true },
-      );
-      api.ui.toast({
-        variant: "success",
-        message: "Side answer added to prompt.",
-      });
+      await context.client.session.prompt({ sessionID: originSessionID, text: buildContinuePrompt(transcript) });
+      context.ui.toast.show({ variant: "success", message: "Side answer added to main session." });
       await cleanup();
     } catch (cause) {
-      api.ui.toast({
-        variant: "error",
-        message: `Failed to continue in main thread: ${getErrorMessage(cause)}`,
-      });
+      context.ui.toast.show({ variant: "error", message: `Failed to continue in main thread: ${getErrorMessage(cause)}` });
     } finally {
       continuing = false;
     }
   };
 
-  const toggleThinking = () => {
-    dialogState.thinkingEnabled = !dialogState.thinkingEnabled;
-    thinkingPreference.set(dialogState.thinkingEnabled);
-    dialogState.expandedThinkingPartIDs = {};
-    renderOverlay();
-  };
-
+  const toggleThinking = () => { dialogState.thinkingEnabled = !dialogState.thinkingEnabled; thinkingPreference.set(dialogState.thinkingEnabled); dialogState.expandedThinkingPartIDs = {}; renderOverlay(); };
   const toggleThinkingPart = (partID: string) => {
-    if (dialogState.expandedThinkingPartIDs[partID]) {
-      delete dialogState.expandedThinkingPartIDs[partID];
-    } else {
-      dialogState.expandedThinkingPartIDs[partID] = true;
-    }
+    if (dialogState.expandedThinkingPartIDs[partID]) delete dialogState.expandedThinkingPartIDs[partID];
+    else dialogState.expandedThinkingPartIDs[partID] = true;
     renderOverlay();
   };
 
   const renderOverlay = (options: { focusInput?: boolean } = {}) => {
     if (closed) return;
     syncCounterState();
-    const streamingActive =
-      dialogState.loading || Boolean(dialogState.streamingAnswer);
+    const streamingActive = dialogState.loading || Boolean(dialogState.streamingAnswer);
     const currentScrollTop = overlayScroller?.scrollTop ?? 0;
     const currentScrollHeight = overlayScroller?.scrollHeight ?? 0;
     if (streamingActive && !forceScrollToBottom && !pendingScrollToBottom) {
-      if (isScrollerAtBottom()) {
-        followStreamingToBottom = true;
-      } else if (
-        currentScrollTop < lastScrollTop ||
-        currentScrollHeight <= lastScrollHeight
-      ) {
-        followStreamingToBottom = false;
-      }
+      if (isScrollerAtBottom()) followStreamingToBottom = true;
+      else if (currentScrollTop < lastScrollTop || currentScrollHeight <= lastScrollHeight) followStreamingToBottom = false;
     }
-    const shouldScrollToBottom =
-      forceScrollToBottom || (streamingActive && followStreamingToBottom);
+    const shouldScrollToBottom = forceScrollToBottom || (streamingActive && followStreamingToBottom);
     forceScrollToBottom = false;
     updateScrollSnapshot();
-    if (renderTimer) {
-      clearTimeout(renderTimer);
-      renderTimer = undefined;
-    }
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = undefined; }
     if (hidden) return;
     setOverlay({
-      api,
+      context,
       title,
-      version,
       modelName: getModelName(),
       hideKey,
       toggleThinkingKeybind: config.toggleThinkingKeybind,
       state: dialogState,
-      onScroller: (scroller) => {
-        overlayScroller = scroller;
-      },
-      onInput: (input) => {
-        overlayInput = input;
-      },
+      onScroller: (scroller) => { overlayScroller = scroller; },
+      onInput: (input) => { overlayInput = input; },
       onHide: () => hide(),
       onClose: () => void closeFromUser(),
       onContinue: () => void continueInMainThread(),
-      onChangeModel: () =>
-        openPickerFn(() => renderOverlay({ focusInput: true })),
+      onChangeModel: () => openPickerFn(() => renderOverlay({ focusInput: true })),
       onToggleThinking: toggleThinking,
       onToggleThinkingPart: toggleThinkingPart,
       onSubmit: submitPrompt,
@@ -445,86 +276,41 @@ export async function startQuestion(
       },
     });
     if (options.focusInput) scheduleInputFocus();
-    if (dialogState.loading) startSpinnerTimer();
-    else clearSpinnerTimer();
+    if (dialogState.loading) startSpinnerTimer(); else clearSpinnerTimer();
     if (shouldScrollToBottom) scheduleScrollToBottom();
   };
 
   const setPromptError = (path: ErrorPath, cause: unknown) => {
     dialogState.error = getErrorMessage(cause);
-    dialogState.errorDetail = buildMiniErrorDetail({
-      path,
-      sessionID: tempSessionID,
-      resolvedModel: getResolvedModel(),
-      resolvedAgent,
-    });
+    dialogState.errorDetail = buildMiniErrorDetail({ path, sessionID: tempSessionID, resolvedModel: getResolvedModel(), resolvedAgent });
     dialogState.loading = false;
     clearSpinnerTimer();
   };
 
-  const show = () => {
-    if (closed) return;
-    hidden = false;
-    renderOverlay({ focusInput: true });
-  };
-
-  const controller = {
-    close: cleanup,
-    hide,
-    show,
-    isVisible: () => !hidden,
-  };
-
-  const scheduleRenderOverlay = () => {
-    if (closed || renderTimer) return;
-    renderTimer = setTimeout(() => {
-      renderTimer = undefined;
-      renderOverlay();
-    }, 50);
-  };
-
+  const show = () => { if (closed) return; hidden = false; renderOverlay({ focusInput: true }); };
+  const controller = { close: cleanup, hide, show, isVisible: () => !hidden };
+  const scheduleRenderOverlay = () => { if (closed || renderTimer) return; renderTimer = setTimeout(() => { renderTimer = undefined; renderOverlay(); }, 50); };
   active.set(controller);
   renderOverlay({ focusInput: true });
 
-  try {
-    resolvedAgent = await resolveRuntimeMiniAgent(api, config);
-  } catch (cause) {
+  try { resolvedAgent = await resolveRuntimeMiniAgent(context, config); }
+  catch (cause) {
     if (closed) return;
-    api.ui.toast({
-      variant: "error",
-      message: `Failed to open mini session: ${getErrorMessage(cause)}`,
-    });
+    context.ui.toast.show({ variant: "error", message: `Failed to open mini session: ${getErrorMessage(cause)}` });
     await cleanup();
     return;
   }
-
   if (closed) return;
-  system = buildMiniSystemPrompt(context, resolvedAgent, mode);
-  dialogState.notice = formatMiniNotice(
-    defaultResolvedModel.notice,
-    ...resolvedAgent.notices,
-  );
+  preamble = buildMiniPreamble(contextText, resolvedAgent, mode);
+  dialogState.notice = formatMiniNotice(defaultResolvedModel.notice, ...resolvedAgent.notices);
   renderOverlay();
 
   function submitPrompt(value: string) {
     const prompt = value.trim();
     if (!prompt || closed) return false;
-    if (dialogState.loading) {
-      api.ui.toast({
-        variant: "warning",
-        message: "Wait for the current response.",
-      });
-      return false;
-    }
-    if (!tempSessionID) {
-      api.ui.toast({
-        variant: "warning",
-        message: "mini session is still opening.",
-      });
-      return false;
-    }
+    if (dialogState.loading) { context.ui.toast.show({ variant: "warning", message: "Wait for the current response." }); return false; }
+    if (!tempSessionID) { context.ui.toast.show({ variant: "warning", message: "mini session is still opening." }); return false; }
     const promptSessionID = tempSessionID;
-
     dialogState.error = undefined;
     dialogState.errorDetail = undefined;
     dialogState.loading = true;
@@ -532,136 +318,80 @@ export async function startQuestion(
     dialogState.streamingAnswer = "";
     followStreamingToBottom = true;
     forceScrollToBottom = true;
-    submissionModelQueue.push(getModelName());
-
     renderOverlay({ focusInput: true });
-
     void (async () => {
       try {
-        const resolvedModel = getResolvedModel();
-        await api.client.session.promptAsync(
-          buildMiniPromptPayload(resolvedAgent, {
-            sessionID: promptSessionID,
-            system,
-            prompt,
-            resolvedModel,
-          }),
-          { throwOnError: true },
-        );
+        const isFirst = !dialogState.lastCompletedMiniInputTokens;
+        const text = isFirst ? `${preamble}\n\n---\n\n${prompt}` : prompt;
+        await context.client.session.prompt({ sessionID: promptSessionID, text });
       } catch (cause) {
         if (closed) return;
         setPromptError("promptAsync throw", cause);
         renderOverlay();
       }
     })();
-
     return true;
   }
 
   try {
-    const created = await api.client.session.create(
-      buildMiniSessionCreatePayload(resolvedAgent, {
-        parentID: sessionID,
+    const resolvedModel = getResolvedModel();
+    const created = await context.client.session.create(
+      buildSessionCreatePayload(resolvedAgent, {
         title: "mini session",
-        directory: api.state.path.directory,
-      }),
-      { throwOnError: true },
+        directory: context.location?.directory ?? "",
+        model: resolvedModel,
+      }) as SessionCreateInput,
     );
-    tempSessionID = created.data.id;
+    tempSessionID = created.id;
     const ephemeralSessionID = tempSessionID;
 
     const refreshSession = () => {
-      dialogState.entries = getSessionEntries(api, ephemeralSessionID);
+      dialogState.entries = getSessionEntries(context, ephemeralSessionID);
       dialogState.streamingAnswer = "";
       refreshLastCompletedMiniInputTokens();
     };
-
     const refreshLastCompletedMiniInputTokens = () => {
       const latest = getLastCompletedMiniInputUsage(dialogState.entries);
       if (!latest) return;
-
       const current = dialogState.lastCompletedMiniInputTokens;
-      if (current === undefined || latest.totalTokens > current) {
-        dialogState.lastCompletedMiniInputTokens = latest.totalTokens;
-        currentTokenMessageID = latest.messageID;
-        return;
-      }
-
-      if (latest.messageID === currentTokenMessageID) {
-        return;
-      }
-
-      if (incrementedTokenMessageIDs.has(latest.messageID)) {
-        return;
-      }
-
+      if (current === undefined || latest.totalTokens > current) { dialogState.lastCompletedMiniInputTokens = latest.totalTokens; currentTokenMessageID = latest.messageID; return; }
+      if (latest.messageID === currentTokenMessageID) return;
+      if (incrementedTokenMessageIDs.has(latest.messageID)) return;
       incrementedTokenMessageIDs.add(latest.messageID);
       dialogState.lastCompletedMiniInputTokens = current + latest.inputTokens;
       currentTokenMessageID = latest.messageID;
     };
 
-    if (closed) {
-      try {
-        await api.client.session.delete(
-          { sessionID: ephemeralSessionID },
-          { throwOnError: true },
-        );
-      } catch {}
-      return;
-    }
+    if (closed) { try { await context.client.session.remove({ sessionID: ephemeralSessionID }); } catch {} return; }
 
     unsubscribers.push(
-      api.event.on("session.idle", (event) => {
-        if (event.properties.sessionID !== tempSessionID) return;
-        const usedModel = submissionModelQueue.shift();
+      context.data.on("session.idle" as never, (event: { data: { sessionID: string } }) => {
+        if (event.data.sessionID !== tempSessionID) return;
         refreshSession();
-        if (usedModel) {
-          for (const entry of dialogState.entries) {
-            if (
-              entry.info.role === "assistant" &&
-              !dialogState.messageModels[entry.info.id]
-            ) {
-              dialogState.messageModels[entry.info.id] = usedModel;
-            }
-          }
-        }
-        if (!extractAssistantText(dialogState.entries)) {
-          dialogState.streamingAnswer = "No response generated.";
-        }
+        if (!extractAssistantText(dialogState.entries)) dialogState.streamingAnswer = "No response generated.";
         dialogState.loading = false;
         clearSpinnerTimer();
         renderOverlay();
       }),
     );
-
     unsubscribers.push(
-      api.event.on("message.updated", (event) => {
-        if (event.properties.sessionID !== tempSessionID) return;
-        refreshSession();
-        renderOverlay();
-      }),
-    );
-
-    unsubscribers.push(
-      api.event.on("session.next.text.delta", (event) => {
-        if (event.properties.sessionID !== tempSessionID) return;
-        dialogState.streamingAnswer += event.properties.delta;
+      context.data.on("session.text.delta" as never, (event: { data: { sessionID: string; delta: string } }) => {
+        if (event.data.sessionID !== tempSessionID) return;
+        dialogState.streamingAnswer += event.data.delta;
         scheduleRenderOverlay();
       }),
     );
-
     unsubscribers.push(
-      api.event.on("message.part.updated", (event) => {
-        if (event.properties.sessionID !== tempSessionID) return;
+      context.data.on("session.step.ended" as never, (event: { data: { sessionID: string } }) => {
+        if (event.data.sessionID !== tempSessionID) return;
         refreshSession();
         renderOverlay();
       }),
     );
-
     unsubscribers.push(
-      api.event.on("session.error", (event) => {
-        if (event.properties.sessionID !== tempSessionID) return;
-        setPromptError("session.error event", event.properties.error);
+      context.data.on("session.execution.failed" as never, (event: { data: { sessionID: string; error: { message: string } } }) => {
+        if (event.data.sessionID !== tempSessionID) return;
+        setPromptError("session.execution.failed", event.data.error.message);
         renderOverlay();
       }),
     );
@@ -673,122 +403,95 @@ export async function startQuestion(
 }
 
 export function openModelPicker(
-  api: TuiPluginApi,
+  context: Plugin.Context,
   config: MiniConfig,
   sessionID: string,
   modelPreference: ModelPreferenceState,
   onAfterSelect?: () => void,
 ) {
+  const sessionInfo = context.data.session.get(sessionID);
+  const models = context.data.location.model.list(sessionInfo?.location) as ModelInfo[] | undefined;
+  const providers = context.data.location.provider.list(sessionInfo?.location);
   const { model: defaultModel, source: defaultSource } = resolveDefaultModel(
-    api.state.provider,
-    config.model,
-    config.variant,
-    getSessionEntries(api, sessionID),
+    models, config.model, config.variant, sessionInfo?.model,
+    getSessionEntries(context, sessionID),
   );
-  const options = buildModelOptions(api, defaultModel, defaultSource);
-
-  api.ui.dialog.setSize("large");
-  api.ui.dialog.replace(() =>
-    api.ui.DialogSelect<ModelSelectValue>({
+  const options = buildModelOptions(models, providers, defaultModel, defaultSource);
+  const sourceLabel: Record<ModelSource, string> = { config: "config", session: "main session", default: "default" };
+  void (async () => {
+    const result = await context.ui.dialog.select<ModelSelectValue>({
       title: "mini model",
       placeholder: "Select model for future mini-session questions",
-      options,
-      onSelect: (option) => {
-        if (option.value.type === "default") {
-          modelPreference.set(undefined);
-          api.ui.toast({
-            variant: "success",
-            message: "mini model reset to default.",
-          });
-        } else {
-          modelPreference.set({
-            model: option.value.model,
-            variant: option.value.variant,
-          });
-          api.ui.toast({
-            variant: "success",
-            message: `mini model set to ${formatResolvedModel({
-              model: option.value.model,
-              variant: option.value.variant,
-            })}.`,
-          });
-        }
-        api.ui.dialog.clear();
-        onAfterSelect?.();
-      },
-    }),
-  );
+      options: options.map((o) => ({ title: o.title, value: o.value, description: o.description, category: o.category })),
+    });
+    if (!result) return;
+    if (result.type === "default") {
+      modelPreference.set(undefined);
+      context.ui.toast.show({ variant: "success", message: "mini model reset to default." });
+    } else {
+      modelPreference.set(result.model);
+      context.ui.toast.show({ variant: "success", message: `mini model set to ${formatResolvedModel(result.model)}.` });
+    }
+    onAfterSelect?.();
+  })();
 }
 
 function buildModelOptions(
-  api: TuiPluginApi,
+  models: ModelInfo[] | undefined,
+  providers: readonly { id: string; name: string }[] | undefined,
   defaultModel: ResolvedModel,
   defaultSource: ModelSource,
-): TuiDialogSelectOption<ModelSelectValue>[] {
-  const providers = [...api.state.provider].sort((left, right) =>
-    left.name.localeCompare(right.name),
-  );
-
-  const defaultModelName = defaultModel.model
-    ? providers.find((p) => p.id === defaultModel.model!.providerID)?.models[
-        defaultModel.model!.modelID
-      ]?.name || defaultModel.model!.modelID
+): Array<{ title: string; value: ModelSelectValue; description: string; category: string }> {
+  const sourceLabel: Record<ModelSource, string> = { config: "config", session: "main session", default: "default" };
+  const providerName = (id: string) => providers?.find((p) => p.id === id)?.name ?? id;
+  const defaultModelName = defaultModel.providerID && defaultModel.id
+    ? (models?.find((m) => m.providerID === defaultModel.providerID && m.id === defaultModel.id)?.name ?? defaultModel.id)
     : "default";
 
-  const sourceLabel: Record<ModelSource, string> = {
-    config: "config",
-    session: "main session",
-    unknown: "unknown",
-  };
-
-  const options: TuiDialogSelectOption<ModelSelectValue>[] = [
+  const options: Array<{ title: string; value: ModelSelectValue; description: string; category: string }> = [
     {
-      title:
-        defaultModelName +
-        (defaultModel.variant ? ` (${defaultModel.variant})` : ""),
+      title: defaultModelName + (defaultModel.variant ? ` (${defaultModel.variant})` : ""),
       value: { type: "default" },
-      description: `${formatResolvedModel(defaultModel)}`,
+      description: formatResolvedModel(defaultModel),
       category: `Default [${sourceLabel[defaultSource]}]`,
     },
   ];
 
-  for (const provider of providers) {
-    const models = Object.values(provider.models).sort((left, right) =>
-      left.name.localeCompare(right.name),
-    );
-    for (const model of models) {
-      const resolved = {
-        providerID: model.providerID,
-        modelID: model.id,
-      };
-      options.push({
-        title: model.name || model.id,
-        value: { type: "model", model: resolved },
-        description: `${provider.id}/${model.id}`,
-        category: provider.name,
-      });
+  if (!models) return options;
+  const byProvider = new Map<string, ModelInfo[]>();
+  for (const m of models) {
+    const arr = byProvider.get(m.providerID) ?? [];
+    arr.push(m);
+    byProvider.set(m.providerID, arr);
+  }
 
-      for (const variant of Object.keys(model.variants ?? {}).sort()) {
+  for (const [providerID, providerModels] of [...byProvider.entries()].sort((a, b) => providerName(a[0]).localeCompare(providerName(b[0])))) {
+    for (const m of providerModels.sort((a, b) => a.name.localeCompare(b.name))) {
+      const value: ResolvedModel = { providerID: m.providerID, id: m.id };
+      options.push({
+        title: m.name || m.id,
+        value: { type: "model", model: value },
+        description: `${providerID}/${m.id}`,
+        category: providerName(providerID),
+      });
+      for (const variant of [...(m.variants ?? [])].sort((a, b) => a.id.localeCompare(b.id))) {
         options.push({
-          title: `${model.name || model.id} (${variant})`,
-          value: { type: "model", model: resolved, variant },
-          description: `${provider.id}/${model.id}`,
-          category: provider.name,
+          title: `${m.name || m.id} (${variant.id})`,
+          value: { type: "model", model: { ...value, variant: variant.id } },
+          description: `${providerID}/${m.id}`,
+          category: providerName(providerID),
         });
       }
     }
   }
-
   return options;
 }
 
-export function extractAssistantText(
-  entries: AnswerDialogState["entries"],
-): string {
+export function extractAssistantText(entries: SessionMessageInfo[]): string {
   const chunks: string[] = [];
   for (const entry of entries) {
-    if (entry.info.role !== "assistant") continue;
-    for (const part of entry.parts) {
+    if (entry.type !== "assistant") continue;
+    for (const part of entry.content) {
       if (part.type === "text" && part.text.trim()) chunks.push(part.text);
     }
   }
@@ -797,21 +500,20 @@ export function extractAssistantText(
 
 function buildMiniSessionTranscript(state: AnswerDialogState) {
   const lines: string[] = [];
-
   for (const entry of state.entries) {
     const chunks: string[] = [];
-    for (const part of entry.parts) {
-      if (part.type === "text" && part.text.trim())
-        chunks.push(part.text.trim());
+    if (entry.type === "user" && entry.text.trim()) chunks.push(entry.text.trim());
+    if (entry.type === "assistant") {
+      for (const part of entry.content) {
+        if (part.type === "text" && part.text.trim()) chunks.push(part.text.trim());
+      }
     }
-    if (chunks.length > 0)
-      lines.push(`${entry.info.role}:\n${chunks.join("\n\n")}`);
+    if (chunks.length > 0) {
+      const role = entry.type === "assistant" ? "assistant" : entry.type === "user" ? "user" : "system";
+      lines.push(`${role}:\n${chunks.join("\n\n")}`);
+    }
   }
-
-  if (state.streamingAnswer.trim()) {
-    lines.push(`assistant:\n${state.streamingAnswer.trim()}`);
-  }
-
+  if (state.streamingAnswer.trim()) lines.push(`assistant:\n${state.streamingAnswer.trim()}`);
   return lines.join("\n\n").trim();
 }
 
@@ -819,25 +521,18 @@ function buildContinuePrompt(transcript: string) {
   return ["[Context from a mini session]", transcript, "---\n"].join("\n\n");
 }
 
-function getLastCompletedMiniInputUsage(entries: AnswerDialogState["entries"]) {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const info = entries[index]?.info;
-    if (info.role !== "assistant") continue;
-    if (!info.time?.completed) continue;
-    if (info.tokens) {
+function getLastCompletedMiniInputUsage(entries: SessionMessageInfo[]) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "assistant") continue;
+    if (!entry.time.completed) continue;
+    if (entry.tokens) {
       return {
-        messageID: info.id,
-        inputTokens: info.tokens.input,
-        totalTokens: getAssistantInputTokens(info.tokens),
+        messageID: entry.id,
+        inputTokens: entry.tokens.input + (entry.tokens.cache?.read ?? 0) + (entry.tokens.cache?.write ?? 0),
+        totalTokens: entry.tokens.input + entry.tokens.output + entry.tokens.reasoning + (entry.tokens.cache?.read ?? 0) + (entry.tokens.cache?.write ?? 0),
       };
     }
   }
   return undefined;
-}
-
-function getAssistantInputTokens(tokens: {
-  input: number;
-  cache?: { read?: number; write?: number };
-}) {
-  return tokens.input + (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0);
 }

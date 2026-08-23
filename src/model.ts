@@ -1,7 +1,7 @@
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import type { ResolvedModel, SessionEntry } from "./types";
+import type { ModelInfo, ModelRef, SessionMessageInfo } from "@opencode-ai/client";
+import type { ResolvedModel } from "./types";
 
-export type ModelSource = "config" | "session" | "unknown";
+export type ModelSource = "config" | "session" | "default";
 
 export type ResolvedModelWithSource = {
   model: ResolvedModel;
@@ -9,102 +9,79 @@ export type ResolvedModelWithSource = {
   notice?: string;
 };
 
+export function parseModelOverride(value: string): ResolvedModel | undefined {
+  const [providerID, ...rest] = value.split("/");
+  const id = rest.join("/");
+  if (!providerID || !id) return undefined;
+  return { providerID, id };
+}
+
 export function resolveModel(
   modelOverride: string | null,
   variantOverride: string | null,
-  entries: SessionEntry[],
+  entries: SessionMessageInfo[],
+  sessionModel?: ModelRef,
 ): ResolvedModelWithSource {
-  if (modelOverride)
+  if (modelOverride) {
+    const model = parseModelOverride(modelOverride);
+    if (model) return { model: { ...model, ...(variantOverride ? { variant: variantOverride } : {}) }, source: "config" };
+  }
+
+  if (sessionModel) {
     return {
-      model: {
-        model: parseModelOverride(modelOverride),
-        ...(variantOverride ? { variant: variantOverride } : {}),
-      },
-      source: "config",
+      model: { providerID: sessionModel.providerID, id: sessionModel.id, variant: sessionModel.variant },
+      source: "session",
     };
+  }
 
-  let assistantFallback: ResolvedModel | undefined;
-
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const { info } = entries[index];
-    if (info.role === "user") {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "assistant" && entry.model) {
       return {
-        model: {
-          model: {
-            providerID: info.model.providerID,
-            modelID: info.model.modelID,
-          },
-          variant: info.model.variant,
-        },
+        model: { providerID: entry.model.providerID, id: entry.model.id, variant: entry.model.variant },
         source: "session",
-      };
-    }
-
-    if (!assistantFallback) {
-      assistantFallback = {
-        model: {
-          providerID: info.providerID,
-          modelID: info.modelID,
-        },
-        variant: info.variant,
       };
     }
   }
 
-  if (assistantFallback)
-    return { model: assistantFallback, source: "session" };
-
-  return { model: {}, source: "unknown" };
-}
-
-export function parseModelOverride(value: string) {
-  const [providerID, ...rest] = value.split("/");
-  const modelID = rest.join("/");
-  if (!providerID || !modelID) return undefined;
-  return { providerID, modelID };
+  return { model: {}, source: "default" };
 }
 
 export function resolveDefaultModel(
-  providers: TuiPluginApi["state"]["provider"],
+  models: ModelInfo[] | undefined,
   configuredModel: string | null,
   configuredVariant: string | null,
-  entries: SessionEntry[],
+  sessionModel: ModelRef | undefined,
+  entries: SessionMessageInfo[],
 ): ResolvedModelWithSource {
-  const resolved = resolveModel(configuredModel, configuredVariant, entries);
+  const resolved = resolveModel(configuredModel, configuredVariant, entries, sessionModel);
   if (resolved.source !== "config") return resolved;
-  if (isAvailableModel(providers, resolved.model)) return resolved;
+  if (isAvailableModel(models, resolved.model)) return resolved;
 
   return {
-    ...resolveModel(null, null, entries),
+    ...resolveModel(null, null, entries, sessionModel),
     notice: `Configured mini model ${formatResolvedModel(resolved.model)} was not found. The main session model will be used.`,
   };
 }
 
-function isAvailableModel(
-  providers: TuiPluginApi["state"]["provider"],
-  resolved: ResolvedModel,
-) {
-  const model = resolved.model;
+function isAvailableModel(models: ModelInfo[] | undefined, resolved: ResolvedModel) {
+  if (!resolved.providerID || !resolved.id) return false;
+  const model = models?.find((m) => m.providerID === resolved.providerID && m.id === resolved.id);
   if (!model) return false;
-  const available = providers.find((provider) => provider.id === model.providerID)
-    ?.models[model.modelID];
-  if (!available) return false;
-  return !resolved.variant || Boolean(available.variants?.[resolved.variant]);
+  if (!resolved.variant) return true;
+  return model.variants.some((v) => v.id === resolved.variant);
 }
 
 export function formatResolvedModel(resolved: ResolvedModel) {
-  if (!resolved.model) return "default";
-  const base = `${resolved.model.providerID}/${resolved.model.modelID}`;
+  if (!resolved.providerID || !resolved.id) return "default";
+  const base = `${resolved.providerID}/${resolved.id}`;
   return resolved.variant ? `${base} (${resolved.variant})` : base;
 }
 
 export function resolveModelContextWindow(
-  providers: TuiPluginApi["state"]["provider"],
+  models: ModelInfo[] | undefined,
   resolved: ResolvedModel,
-) {
-  const model = resolved.model;
-  if (!model) return undefined;
-  return providers.find((provider) => provider.id === model.providerID)?.models[
-    model.modelID
-  ]?.limit?.context;
+): number | undefined {
+  if (!resolved.providerID || !resolved.id) return undefined;
+  return models?.find((m) => m.providerID === resolved.providerID && m.id === resolved.id)?.limit?.context;
 }

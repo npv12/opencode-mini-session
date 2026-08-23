@@ -1,107 +1,49 @@
-import type { Provider } from "@opencode-ai/sdk/v2";
 import { describe, expect, it } from "vitest";
-import { resolveDefaultModel, resolveModelContextWindow } from "../src/model";
-import type { SessionEntry } from "../src/types";
+import { resolveModel, resolveDefaultModel, formatResolvedModel, parseModelOverride, resolveModelContextWindow } from "../src/model";
+import type { SessionMessageInfo, ModelInfo } from "@opencode-ai/client";
 
-function providerWithVariants(): Provider[] {
-  return [
-    {
-      id: "anthropic",
-      name: "Anthropic",
-        models: {
-          "claude-sonnet-4.6": {
-            id: "claude-sonnet-4.6",
-            providerID: "anthropic",
-            name: "Claude Sonnet 4.6",
-            limit: {
-              context: 200_000,
-              output: 8_000,
-            },
-            variants: {
-              fast: {},
-              thinking: {},
-          },
-        },
-      },
-    },
-  ] as unknown as Provider[];
-}
+const models: ModelInfo[] = [
+  { id: "claude-sonnet", modelID: "claude-sonnet", providerID: "anthropic", name: "Claude Sonnet", family: undefined, package: "@opencode-ai/provider-anthropic", status: "active", enabled: true, capabilities: { tools: true, input: ["text"], output: ["text"] }, variants: [], time: { released: 0 }, cost: [], limit: { context: 200_000, output: 8_192 } },
+  { id: "gpt-4o", modelID: "gpt-4o", providerID: "openai", name: "GPT-4o", family: undefined, package: "@opencode-ai/provider-openai", status: "active", enabled: true, capabilities: { tools: true, input: ["text"], output: ["text"] }, variants: [{ id: "snapshot" }], time: { released: 0 }, cost: [], limit: { context: 128_000, output: 4_096 } },
+];
 
-function sessionEntries(): SessionEntry[] {
-  return [
-    {
-      info: {
-        role: "assistant",
-        providerID: "openai",
-        modelID: "gpt-5",
-        variant: "default",
-      },
-      parts: [],
-    },
-  ] as unknown as SessionEntry[];
-}
-
-describe("default model resolution", () => {
-  it("includes configured variants when available", () => {
-    const resolved = resolveDefaultModel(
-      providerWithVariants(),
-      "anthropic/claude-sonnet-4.6",
-      "fast",
-      sessionEntries(),
-    );
-
-    expect(resolved.source).toBe("config");
-    expect(resolved.model).toEqual({
-      model: {
-        providerID: "anthropic",
-        modelID: "claude-sonnet-4.6",
-      },
-      variant: "fast",
-    });
-    expect(resolved.notice).toBeUndefined();
+describe("resolveModel", () => {
+  it("returns config when model override set", () => {
+    const result = resolveModel("anthropic/claude-sonnet", null, []);
+    expect(result.source).toBe("config");
+    expect(result.model?.providerID).toBe("anthropic");
+    expect(result.model?.id).toBe("claude-sonnet");
   });
-
-  it("falls back to the session model when the configured variant is unavailable", () => {
-    const resolved = resolveDefaultModel(
-      providerWithVariants(),
-      "anthropic/claude-sonnet-4.6",
-      "missing",
-      sessionEntries(),
-    );
-
-    expect(resolved.source).toBe("session");
-    expect(resolved.model).toEqual({
-      model: {
-        providerID: "openai",
-        modelID: "gpt-5",
-      },
-      variant: "default",
-    });
-    expect(resolved.notice).toContain(
-      "Configured mini model anthropic/claude-sonnet-4.6 (missing) was not found.",
-    );
+  it("returns unknown when no entries", () => {
+    const result = resolveModel(null, null, []);
+    expect(result.source).toBe("default");
   });
+});
 
-  it("resolves a selected model context window from provider metadata", () => {
-    expect(
-      resolveModelContextWindow(providerWithVariants(), {
-        model: {
-          providerID: "anthropic",
-          modelID: "claude-sonnet-4.6",
-        },
-        variant: "fast",
-      }),
-    ).toBe(200_000);
-  });
+describe("formatResolvedModel", () => {
+  it("returns default for undefined", () => expect(formatResolvedModel({})).toBe("default"));
+  it("formats provider/id", () => expect(formatResolvedModel({ providerID: "a", id: "b" })).toBe("a/b"));
+  it("formats variant", () => expect(formatResolvedModel({ providerID: "a", id: "b", variant: "snap" })).toBe("a/b (snap)"));
+});
 
-  it("returns undefined when the selected model is missing", () => {
-    expect(
-      resolveModelContextWindow(providerWithVariants(), {
-        model: {
-          providerID: "openai",
-          modelID: "gpt-5",
-        },
-      }),
-    ).toBeUndefined();
+describe("resolveModelContextWindow", () => {
+  it("returns context limit when model found", () => expect(resolveModelContextWindow(models, { providerID: "anthropic", id: "claude-sonnet" })).toBe(200_000));
+  it("returns undefined for unknown model", () => expect(resolveModelContextWindow(models, { providerID: "nope", id: "nope" })).toBeUndefined());
+});
+
+describe("resolveDefaultModel", () => {
+  it("falls back when configured model not found", () => {
+    const result = resolveDefaultModel(models, "openai/notreal", null, undefined, []);
+    expect(result.source).toBe("default");
+    expect(result.notice).toContain("not found");
   });
+});
+
+describe("parseModelOverride", () => {
+  it("parses provider/model", () => {
+    const result = parseModelOverride("anthropic/claude-sonnet");
+    expect(result?.providerID).toBe("anthropic");
+    expect(result?.id).toBe("claude-sonnet");
+  });
+  it("returns undefined for invalid format", () => expect(parseModelOverride("no-slash")).toBeUndefined());
 });

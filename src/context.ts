@@ -1,79 +1,65 @@
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import type { Part } from "@opencode-ai/sdk/v2";
-import type { SessionEntry } from "./types";
+import type { Plugin } from "@opencode-ai/plugin/tui";
+import type { SessionMessageInfo } from "@opencode-ai/client";
 
 export function getSessionEntries(
-  api: TuiPluginApi,
+  context: Plugin.Context,
   sessionID: string,
-): SessionEntry[] {
-  return api.state.session.messages(sessionID).map((info) => ({
-    info,
-    parts: [...api.state.part(info.id)],
-  }));
+): SessionMessageInfo[] {
+  return context.data.session.message.list(sessionID).slice()
+    .sort((a, b) => {
+      const aTime = isFinite((a.time as { created?: number })?.created ?? NaN) ? (a.time as { created?: number }).created! : 0;
+      const bTime = isFinite((b.time as { created?: number })?.created ?? NaN) ? (b.time as { created?: number }).created! : 0;
+      return aTime - bTime;
+    });
 }
 
-export function formatFullContext(entries: SessionEntry[], tokenLimit: number) {
-  return buildCopiedContext(entries, tokenLimit).text;
-}
-
-export function buildCopiedContext(entries: SessionEntry[], tokenLimit: number) {
+export function buildCopiedContext(entries: SessionMessageInfo[], tokenLimit: number) {
   const chunks = entries
     .map((entry) => {
       const text = formatEntry(entry);
       return text ? { text, tokens: estimateTokens(text) } : undefined;
     })
     .filter((chunk): chunk is { text: string; tokens: number } => Boolean(chunk));
-  const totalAvailableTokens = chunks.reduce(
-    (total, chunk) => total + chunk.tokens,
-    0,
-  );
+  const totalAvailableTokens = chunks.reduce((total, chunk) => total + chunk.tokens, 0);
   const selected: string[] = [];
   let usedTokens = 0;
 
-  for (let index = chunks.length - 1; index >= 0; index -= 1) {
-    const chunk = chunks[index];
+  for (let i = chunks.length - 1; i >= 0; i--) {
+    const chunk = chunks[i];
     if (selected.length > 0 && usedTokens + chunk.tokens > tokenLimit) break;
-
     selected.push(chunk.text);
     usedTokens += chunk.tokens;
-
     if (usedTokens >= tokenLimit) break;
   }
 
   if (selected.length === 0) {
-    return {
-      text: "No conversation context available.",
-      usedTokens: 0,
-      totalAvailableTokens,
-    };
+    return { text: "No conversation context available.", usedTokens: 0, totalAvailableTokens };
   }
 
-  return {
-    text: selected.reverse().join("\n\n"),
-    usedTokens,
-    totalAvailableTokens,
-  };
+  return { text: selected.reverse().join("\n\n"), usedTokens, totalAvailableTokens };
 }
 
-function formatEntry(entry: SessionEntry) {
-  const lines: string[] = [];
-
-  for (const part of entry.parts) {
-    if (part.type === "text" && part.text.trim()) lines.push(part.text.trim());
-    if (part.type === "tool") lines.push(formatToolPart(part));
+function formatEntry(entry: SessionMessageInfo): string {
+  if (entry.type === "user") {
+    return entry.text.trim() ? `user:\n${entry.text.trim()}` : "";
   }
-
-  if (lines.length === 0) return "";
-  return `${entry.info.role}:\n${lines.join("\n")}`;
+  if (entry.type === "assistant") {
+    const lines: string[] = [];
+    for (const part of entry.content) {
+      if (part.type === "text" && part.text.trim()) lines.push(part.text.trim());
+      if (part.type === "tool") lines.push(`[tool: ${part.name}${formatToolInput(part.state)}]`);
+    }
+    return lines.length > 0 ? `assistant:\n${lines.join("\n")}` : "";
+  }
+  return "";
 }
 
-function formatToolPart(part: Extract<Part, { type: "tool" }>) {
-  const pairs = Object.entries(part.state.input ?? {})
-    .slice(0, 4)
-    .map(([key, value]) => `${key}=${summarizeValue(value)}`);
-  return pairs.length > 0
-    ? `[tool: ${part.tool} ${pairs.join(" ")}]`
-    : `[tool: ${part.tool}]`;
+function formatToolInput(state: { input?: string | Record<string, unknown> }): string {
+  const input = state.input;
+  if (!input) return "";
+  if (typeof input === "string") return input ? ` ${input}` : "";
+  const pairs = Object.entries(input).slice(0, 4).map(([k, v]) => `${k}=${summarizeValue(v)}`);
+  return pairs.length > 0 ? ` ${pairs.join(" ")}` : "";
 }
 
 function summarizeValue(value: unknown): string {
@@ -85,9 +71,7 @@ function summarizeValue(value: unknown): string {
 }
 
 function truncate(value: string, maxLength: number) {
-  return value.length > maxLength
-    ? `${value.slice(0, maxLength - 3)}...`
-    : value;
+  return value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
 }
 
 export function estimateTokens(text: string) {
